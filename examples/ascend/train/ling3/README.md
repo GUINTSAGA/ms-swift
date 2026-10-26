@@ -33,7 +33,7 @@ Set `PACKING=true` to use packed documents, with optional `PACKING_LENGTH=2048`.
 
 `GRADIENT_CHECKPOINTING=false` is the D1 default for this example only. Set it to `true` to re-enable ordinary model activation checkpointing when memory is insufficient. Swift's global defaults, FSDP2 reshard settings, and FLA's internal autograd recomputation are unchanged. `MAX_STEPS` optionally limits the training duration.
 
-Historical D1 measurements reported 24.565716 to 16.449348 seconds/step, approximately 235.712 input tokens/s, and 2.041 GiB more peak reserved memory. The eight-rank run completed 36 optimizer updates; the P0 control retained a guard exit anomaly. These are historical short-window measurements, not a speed, memory, or training-quality guarantee for this example. No MoE dispatch optimization or Task Queue override is included.
+Disabling activation checkpointing requires more memory. Choose this example's profile only when the memory budget permits it; no speed or training-quality guarantee is made. No MoE dispatch optimization or Task Queue override is included.
 
 Ordinary padded KDA is supported only in cache-free chunk-mode training. Padded decoding/cache, empty sequences, internal mask gaps, conflicting packed metadata, and MTP combinations are outside the supported contract. Unsupported inputs fail explicitly.
 
