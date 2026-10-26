@@ -377,6 +377,92 @@ register_model(
 class BailingHybridLoader(ModelLoader):
 
     @staticmethod
+    def _patch_ling3_packing(model):
+        import inspect
+        import torch
+
+        if hasattr(model, '_swift_ling3_packing_handle'):
+            return
+
+        signature = inspect.signature(model.forward)
+
+        def prepare_packing(module, args, kwargs):
+            call_kwargs = kwargs
+            if args:
+                bound = signature.bind_partial(*args, **kwargs)
+                call_kwargs = dict(bound.arguments)
+                call_kwargs.update(call_kwargs.pop('kwargs', {}))
+            fields = ('cu_seq_lens_q', 'cu_seq_lens_k', 'max_length_q', 'max_length_k')
+            position_ids = call_kwargs.get('position_ids')
+            mask = call_kwargs.get('attention_mask')
+            if not any(call_kwargs.get(key) is not None for key in fields + ('cu_seqlens', )):
+                # Left-padding positions can repeat zero without representing packed documents.
+                if (position_ids is not None and position_ids.ndim == 2 and position_ids.shape[0] == 1
+                        and (mask is None or (mask.ndim == 2 and bool((mask == 1).all()))) and bool(
+                            (position_ids[:, 1:] == 0).any())):
+                    raise ValueError('Ling3 packed position_ids require explicit sequence metadata.')
+                return args, kwargs
+            if any(call_kwargs.get(key) is None for key in fields):
+                raise ValueError('Ling3 packing requires cu_seq_lens_q/k and max_length_q/k together.')
+            if not getattr(getattr(module, 'model', module), '_supports_packing_metadata', False):
+                raise ValueError(
+                    'Ling3 model code does not support packing metadata; install the Swift Ling3 attention adapters.')
+            if module.config._attn_implementation != 'flash_attention_2':
+                raise ValueError('Ling3 packing requires the native flash_attention_2 varlen backend.')
+            use_cache = call_kwargs.get('use_cache')
+            if use_cache is None:
+                use_cache = module.config.use_cache
+            if call_kwargs.get('past_key_values') is not None or use_cache:
+                raise ValueError('Ling3 packing requires use_cache=False and no past_key_values.')
+            if getattr(module.config, 'num_nextn_predict_layers', 0):
+                raise ValueError('Ling3 packing with MTP is not supported.')
+            if (position_ids is None or position_ids.ndim != 2 or position_ids.shape[0] != 1
+                    or position_ids.dtype not in (torch.int32, torch.int64)):
+                raise ValueError('Ling3 packing requires integer position_ids with shape [1, total_tokens].')
+            total = position_ids.shape[1]
+            inputs = call_kwargs.get('input_ids')
+            if inputs is None:
+                inputs = call_kwargs.get('inputs_embeds')
+            if inputs is None and args:
+                inputs = args[0]
+            if inputs is None or inputs.shape[:2] != (1, total):
+                raise ValueError('Ling3 packing requires one flattened input batch matching position_ids.')
+            if mask is not None:
+                if mask.ndim != 2 or mask.shape != position_ids.shape:
+                    raise ValueError('Ling3 packing accepts only a 2-D all-valid keep mask or attention_mask=None.')
+                if not bool((mask == 1).all()):
+                    raise ValueError('Ling3 padding-free packing does not support padding or non-binary keep masks.')
+            cu = call_kwargs['cu_seq_lens_q']
+            if (not isinstance(cu, torch.Tensor) or cu.ndim != 1 or cu.numel() < 2
+                    or cu.dtype not in (torch.int32, torch.int64) or not cu.is_contiguous()
+                    or cu.device != inputs.device or position_ids.device != inputs.device):
+                raise ValueError('Ling3 cumulative lengths must be contiguous integer tensors on the input device.')
+            if int(cu[0]) != 0 or int(cu[-1]) != total or not bool((cu.diff() > 0).all()):
+                raise ValueError(
+                    'Ling3 cumulative lengths must start at zero, end at total_tokens and increase strictly.')
+            for key in ('cu_seq_lens_k', 'cu_seqlens'):
+                other = call_kwargs.get(key)
+                if other is not None and (not isinstance(other, torch.Tensor) or other.device != cu.device
+                                          or other.dtype != cu.dtype or not torch.equal(other, cu)):
+                    raise ValueError(f'Ling3 packing has conflicting {key} boundaries.')
+            starts = (position_ids[0] == 0).nonzero().flatten()
+            consecutive = (position_ids[:, 1:] == 0) | (position_ids.diff(dim=-1) == 1)
+            if (not torch.equal(starts, cu[:-1].to(starts.dtype)) or bool((position_ids < 0).any())
+                    or not bool(consecutive.all())):
+                raise ValueError('Ling3 position_ids must be zero-based consecutive positions within every document.')
+            maximum = cu.diff().max()
+            for key in ('max_length_q', 'max_length_k'):
+                value = call_kwargs[key]
+                if isinstance(value, torch.Tensor) and (value.ndim != 0
+                                                        or value.dtype not in (torch.int32, torch.int64)):
+                    raise ValueError(f'Ling3 {key} must be an integer scalar.')
+                if not isinstance(value, (int, torch.Tensor)) or int(value) != int(maximum):
+                    raise ValueError(f'Ling3 {key} must match the largest document length.')
+            return args, kwargs
+
+        model._swift_ling3_packing_handle = model.register_forward_pre_hook(prepare_packing, with_kwargs=True)
+
+    @staticmethod
     def _patch_dynamic_cache_auto_extend():
         """Patch DynamicCache.update to auto-extend layers for MTP/NextN layers."""
         from transformers.cache_utils import DynamicCache
@@ -413,7 +499,14 @@ class BailingHybridLoader(ModelLoader):
                 rope_scaling['rope_type'] = 'linear'
             if getattr(config, 'num_nextn_predict_layers', 0) > 0:
                 self._patch_dynamic_cache_auto_extend()
-        return super().get_model(model_dir, config, processor, model_kwargs)
+        model = super().get_model(model_dir, config, processor, model_kwargs)
+        if 'BailingMoeV3ForCausalLM' in (getattr(config, 'architectures', None) or []):
+            from .ling3_compat import install_ling3_compat, is_ling3_tiny
+
+            if is_ling3_tiny(config) and not getattr(config, 'num_nextn_predict_layers', 0):
+                install_ling3_compat(model)
+            self._patch_ling3_packing(model)
+        return model
 
 
 register_model(

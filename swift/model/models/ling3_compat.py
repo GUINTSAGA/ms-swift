@@ -1,0 +1,352 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Ling3 packing, padding and short-sequence training adapters."""
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from functools import wraps
+from importlib import import_module
+
+_PACKING_KEYS = ('cu_seq_lens_q', 'cu_seq_lens_k', 'max_length_q', 'max_length_k', 'cu_seqlens')
+
+
+def is_ling3_tiny(config):
+    return (getattr(config, 'hidden_size', None), getattr(config, 'num_hidden_layers',
+                                                          None), getattr(config, 'q_lora_rank',
+                                                                         None)) == (1536, 24, 256)
+
+
+def _packed_params(hidden_states, position_ids, attention_mask, kwargs):
+    supplied = {k: kwargs[k] for k in _PACKING_KEYS if kwargs.get(k) is not None}
+    if position_ids is None:
+        if supplied:
+            raise ValueError('Ling3 packing requires position_ids')
+        return {}
+    if position_ids.ndim != 2 or position_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError('Ling3 requires 2-D integer position_ids')
+    # Batch>1 and single-document positions are ordinary, not packed varlen.
+    resets = position_ids.shape[0] == 1 and bool((position_ids[:, 1:] == 0).any())
+    if not supplied and not resets:
+        return {}
+    if position_ids.shape != hidden_states.shape[:2] or hidden_states.shape[0] != 1:
+        raise ValueError('Ling3 packing requires one flattened batch')
+    if attention_mask is not None and (attention_mask.ndim != 2 or not bool((attention_mask == 1).all())):
+        if supplied:
+            raise ValueError('Ling3 packing does not support real padding or 4-D masks')
+        # Preserve ordinary padded inputs; do not interpret padding zeros as documents.
+        return {}
+    consecutive = (position_ids[:, 1:] == 0) | (position_ids.diff(dim=-1) == 1)
+    if int(position_ids[0, 0]) != 0 or bool((position_ids < 0).any()) or not bool(consecutive.all()):
+        raise ValueError('Ling3 packed positions must reset to zero and increase consecutively')
+    from swift.utils import get_packed_seq_params
+    params = get_packed_seq_params(position_ids)
+    for name, value in supplied.items():
+        expected = params['cu_seq_lens_q'] if name == 'cu_seqlens' else params[name]
+        if isinstance(expected, torch.Tensor) and expected.ndim == 1:
+            if (not isinstance(value, torch.Tensor) or value.device != expected.device or value.dtype != expected.dtype
+                    or not value.is_contiguous() or not torch.equal(value, expected)):
+                raise ValueError(f'Conflicting Ling3 {name}')
+        elif int(value) != int(expected):
+            raise ValueError(f'Conflicting Ling3 {name}')
+    return params if params['cu_seq_lens_q'].numel() > 2 else {}
+
+
+def _singleton_forward(original, causal_conv1d):
+
+    @wraps(getattr(original, '__func__', original))
+    def forward(self,
+                x,
+                residual=None,
+                mask=None,
+                cache=None,
+                output_final_state=False,
+                cu_seqlens=None,
+                chunk_indices=None,
+                **kwargs):
+        count = x.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
+        if not self.training or x.shape[0] * x.shape[1] != count:
+            return original(
+                x,
+                residual=residual,
+                mask=mask,
+                cache=cache,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                **kwargs)
+        if cache is not None or mask is not None:
+            raise ValueError('Ling3 singleton training requires no historical cache or padding')
+        return causal_conv1d(
+            x=x,
+            weight=self.weight.squeeze(1),
+            bias=self.bias,
+            residual=residual,
+            initial_state=None,
+            output_final_state=output_final_state,
+            activation=self.activation,
+            backend=self.backend,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            **kwargs)
+
+    return forward
+
+
+def patch_short_convolution(conv):
+    from fla.modules.conv.causal_conv1d import causal_conv1d
+
+    from ..patcher import patch_module_forward
+    if getattr(conv, '_swift_ling3_singleton', False):
+        return
+    if getattr(conv, '_patched', False):
+        raise ValueError('Ling3 ShortConvolution already has a conflicting patch')
+    original = getattr(conv, '_old_forward', conv.forward)
+    patch_module_forward(conv, _singleton_forward(original, causal_conv1d))
+    conv._swift_ling3_singleton = True
+
+
+def _mla_forward(self,
+                 hidden_states,
+                 position_embeddings,
+                 attention_mask,
+                 past_key_values=None,
+                 cache_position=None,
+                 position_ids=None,
+                 *,
+                 original,
+                 rotary,
+                 registry,
+                 **kwargs):
+    if 'past_key_value' in kwargs:
+        if past_key_values is not None:
+            raise ValueError('Specify only one past_key_value(s) argument')
+        past_key_values = kwargs.pop('past_key_value')
+    params = _packed_params(hidden_states, position_ids, attention_mask, kwargs)
+    if params and (past_key_values is not None or kwargs.get('use_cache')):
+        raise ValueError('Ling3 packed MLA does not support historical cache')
+    backend = self.config._attn_implementation
+    if params and backend != 'flash_attention_2':
+        raise ValueError('Ling3 packed MLA requires flash_attention_2 varlen')
+    if backend == 'eager':
+        if attention_mask is None and hidden_states.shape[1] > 1:
+            raise ValueError('Ling3 eager MLA requires an explicit causal mask')
+        return original(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            position_ids=position_ids,
+            **kwargs)
+    interface = registry[backend]
+    batch, length = hidden_states.shape[:2]
+    q_shape = (batch, length, -1, self.qk_head_dim)
+    kv_shape = (batch, length, -1, self.qk_nope_head_dim + self.v_head_dim)
+    q = self.q_proj(hidden_states) if self.q_lora_rank is None else self.q_b_proj(
+        self.q_a_layernorm(self.q_a_proj(hidden_states)))
+    q_pass, q_rot = torch.split(q.view(q_shape).transpose(1, 2), [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+    compressed = self.kv_a_proj_with_mqa(hidden_states)
+    k_pass, k_rot = torch.split(compressed, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    kv = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(kv_shape).transpose(1, 2)
+    k_pass, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+    k_rot = k_rot.view(batch, 1, length, self.qk_rope_head_dim)
+    if not self.config.rope_interleave:
+        raise NotImplementedError('Ling3 non-interleaved rotary weights are not supported')
+    cos, sin = position_embeddings
+    q_rot, k_rot = rotary(q_rot, k_rot, cos, sin)
+    key = torch.cat((k_pass, k_rot.expand(*k_pass.shape[:-1], -1)), dim=-1)
+    query = torch.cat((q_pass, q_rot), dim=-1)
+    if past_key_values is not None:
+        key, value = past_key_values.update(key, value, self.layer_idx, {
+            'sin': sin,
+            'cos': cos,
+            'cache_position': cache_position
+        })
+    padded_value = backend == 'flash_attention_2' and self.qk_head_dim != self.v_head_dim
+    if padded_value:
+        value = F.pad(value, [0, self.qk_head_dim - self.v_head_dim])
+    kwargs.update(params)
+    output, weights = interface(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        position_ids=position_ids,
+        **kwargs)
+    if padded_value:
+        output = output[:, :, :, :self.v_head_dim]
+    if self.g_proj is not None:
+        gate = F.sigmoid(self.g_proj(hidden_states).float()).type_as(hidden_states)
+        if self.gated_attention_proj_granularity_type == 'head_wise':
+            output = output * gate[:, :, :, None]
+        else:
+            output = output * gate.view(batch, length, self.num_heads, self.v_head_dim)
+    return self.dense(output.reshape(batch, length, -1).contiguous()), weights, past_key_values
+
+
+def _padded_kda_forward(self, hidden_states, attention_mask, past_key_value, position_ids, *, chunk_kda, **kwargs):
+    # Ordinary padding only. Packing metadata remains on the original path.
+    if not self.training or past_key_value is not None or kwargs.get('use_cache'):
+        raise ValueError('Ling3 padded KDA supports cache-free training only')
+    if any(kwargs.get(k) is not None for k in _PACKING_KEYS) or kwargs.get('cp_context') is not None:
+        raise ValueError('Ling3 ordinary padding cannot be combined with packing/context parallel metadata')
+    if self.mode != 'chunk':
+        raise ValueError('Ling3 padded KDA training requires chunk mode')
+    if (attention_mask.ndim != 2 or attention_mask.shape != hidden_states.shape[:2]
+            or attention_mask.device != hidden_states.device or not bool(
+                ((attention_mask == 0) | (attention_mask == 1)).all())):
+        raise ValueError('Ling3 padding requires an aligned binary 2-D mask')
+    mask = attention_mask.bool()
+    lengths = mask.sum(-1)
+    if not bool((lengths > 0).all()):
+        raise ValueError('Ling3 padding cannot contain empty sequences')
+    transitions = mask.to(torch.int32).diff(dim=-1)
+    if bool(((transitions == 1).any(-1) & (transitions == -1).any(-1)).any()):
+        raise ValueError('Ling3 padding supports left/right padding, not internal gaps')
+    if position_ids is not None:
+        if (position_ids.ndim != 2 or position_ids.shape[1] != mask.shape[1]
+                or position_ids.shape[0] not in (1, mask.shape[0]) or position_ids.device != hidden_states.device
+                or position_ids.dtype not in (torch.int32, torch.int64)):
+            raise ValueError('Ling3 padding position_ids require [B,T] or [1,T] aligned integer tensors')
+        if position_ids.shape[0] == 1 and mask.shape[0] > 1:
+            # The model's default [1,T] positions can be shared only when
+            # every valid sequence starts at physical position zero.
+            if (not bool(mask[:, 0].all())
+                    or not torch.equal(position_ids[0], torch.arange(mask.shape[1], device=mask.device))):
+                raise ValueError('Ling3 padding broadcast position_ids require right padding and 0-based positions')
+        else:
+            logical = mask.long().cumsum(-1) - 1
+            if not torch.equal(position_ids[mask], logical[mask]):
+                raise ValueError('Ling3 padding position_ids disagree with valid-token logical positions')
+    batch, length, width = hidden_states.shape
+    indices = mask.reshape(-1).nonzero().flatten()
+    hidden_states = hidden_states.reshape(-1, width).index_select(0, indices).unsqueeze(0)
+    cu = torch.cat((lengths.new_zeros(1), lengths.cumsum(0))).contiguous()
+    output, _, _ = _kda_chunk_forward(self, hidden_states, cu, chunk_kda=chunk_kda)
+    output = output.new_zeros(batch * length, width).index_copy(0, indices, output.squeeze(0))
+    return output.reshape(batch, length, width), None, past_key_value
+
+
+def _kda_chunk_forward(self, hidden_states, cu, *, chunk_kda):
+    q, _ = self.q_conv1d(x=self.q_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu)
+    k, _ = self.k_conv1d(x=self.k_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu)
+    v, _ = self.v_conv1d(x=self.v_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu)
+    g = self.f_proj(hidden_states) if self.no_kda_lora else self.f_b_proj(self.f_a_proj(hidden_states))
+    beta = self.b_proj(hidden_states).float().sigmoid()
+    q, k = (rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim) for x in (q, k))
+    v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
+    g = rearrange(g, '... (h d) -> ... h d', d=self.head_dim)
+    output, _ = chunk_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=self.A_log,
+        dt_bias=self.dt_bias,
+        initial_state=None,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        safe_gate=self.safe_gate,
+        lower_bound=self.lower_bound,
+        cu_seqlens=cu)
+    gate = self.g_proj(hidden_states) if self.no_kda_lora else self.g_b_proj(self.g_a_proj(hidden_states))
+    gate = rearrange(gate, '... (h d) -> ... h d', d=self.head_dim)
+    return self.o_proj(rearrange(self.o_norm(output, gate), 'b t h d -> b t (h d)')), None, None
+
+
+def _kda_forward(self,
+                 hidden_states,
+                 attention_mask=None,
+                 past_key_value=None,
+                 position_ids=None,
+                 *,
+                 original,
+                 chunk_kda,
+                 **kwargs):
+    if attention_mask is not None and not bool((attention_mask == 1).all()):
+        return _padded_kda_forward(
+            self, hidden_states, attention_mask, past_key_value, position_ids, chunk_kda=chunk_kda, **kwargs)
+    params = _packed_params(hidden_states, position_ids, attention_mask, kwargs)
+    if params and (past_key_value is not None or kwargs.get('use_cache')):
+        raise ValueError('Ling3 packed KDA does not support historical cache')
+    if params:
+        kwargs['cu_seqlens'] = params['cu_seq_lens_q']
+    if not self.training or hidden_states.shape[1] > 64 or past_key_value is not None:
+        return original(
+            hidden_states,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            position_ids=position_ids,
+            **kwargs)
+    if self.mode != 'chunk':
+        raise ValueError('Ling3 KDA training requires chunk mode')
+    output, _, _ = _kda_chunk_forward(self, hidden_states, kwargs.get('cu_seqlens'), chunk_kda=chunk_kda)
+    return output, None, past_key_value
+
+
+def _make_mla_forward(original, rotary, registry):
+
+    @wraps(getattr(original, '__func__', original))
+    def forward(self, *args, **kwargs):
+        return _mla_forward(self, *args, original=original, rotary=rotary, registry=registry, **kwargs)
+
+    return forward
+
+
+def _make_kda_forward(original, chunk_kda):
+
+    @wraps(getattr(original, '__func__', original))
+    def forward(self, *args, **kwargs):
+        return _kda_forward(self, *args, original=original, chunk_kda=chunk_kda, **kwargs)
+
+    return forward
+
+
+def install_ling3_compat(model):
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    from ..patcher import patch_module_forward
+    if getattr(model, '_swift_ling3_compat', None):
+        return
+    if not is_ling3_tiny(model.config):
+        raise NotImplementedError('Ling3 attention compatibility is limited to the tiny configuration')
+    if getattr(model.config, 'num_nextn_predict_layers', 0):
+        raise NotImplementedError('Ling3 packing with MTP is not supported')
+    modeling = import_module(type(model).__module__)
+    if not callable(getattr(modeling, 'apply_rotary_pos_emb_interleave', None)) or not callable(
+            getattr(modeling, 'chunk_kda', None)):
+        raise ValueError('Ling3 model does not expose the required rotary/KDA operators')
+    pending = []
+    for layer in model.model.layers:
+        attention = layer.attention
+        if getattr(attention, '_patched', False):
+            raise ValueError('Ling3 attention already has a conflicting forward patch')
+        original = getattr(attention, '_old_forward', attention.forward)
+        if layer.attention_layer_type == 'attention':
+            if getattr(attention, 'num_key_value_groups', 1) != 1:
+                raise NotImplementedError('Ling3 MLA compatibility requires equal query/key-value head counts')
+            required = ('q_lora_rank', 'kv_a_proj_with_mqa', 'kv_a_layernorm', 'kv_b_proj', 'dense', 'is_causal')
+            forward = _make_mla_forward(original, modeling.apply_rotary_pos_emb_interleave, ALL_ATTENTION_FUNCTIONS)
+        elif layer.attention_layer_type == 'linear_attention':
+            required = ('q_conv1d', 'k_conv1d', 'v_conv1d', 'A_log', 'dt_bias', 'o_norm', 'o_proj')
+            forward = _make_kda_forward(original, modeling.chunk_kda)
+        else:
+            raise NotImplementedError(f'Unknown Ling3 attention type: {layer.attention_layer_type}')
+        if not all(hasattr(attention, name) for name in required):
+            raise ValueError('Ling3 attention is missing required projection/kernel capabilities')
+        pending.append((attention, forward))
+    for layer in model.model.layers:
+        if layer.attention_layer_type == 'linear_attention':
+            for name in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
+                patch_short_convolution(getattr(layer.attention, name))
+    for attention, forward in pending:
+        attention._swift_ling3_origin_forward = getattr(attention, '_old_forward', attention.forward)
+        patch_module_forward(attention, forward)
+    model.model._supports_packing_metadata = True
+    model._swift_ling3_compat = {
+        'policy': 'attention-local-position-boundaries; native MLA dispatch; short training chunk'
+    }
