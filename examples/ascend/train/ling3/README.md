@@ -1,6 +1,6 @@
 # Ling3 Ascend FSDP2 LoRA SFT
 
-The Ling3 loader installs Swift adapters for packed document boundaries, short KDA training, and ordinary left/right padding in cache-free training. MLA uses the configured attention backend. Official Ling3 modeling, weights, and FLA kernels remain unchanged. No private fork or manual model patch is required.
+The Ling3 loader installs Swift adapters for packed document boundaries, short KDA training, and ordinary left/right padding in cache-free training and evaluation. MLA uses the configured attention backend. Official Ling3 modeling, weights, and FLA kernels remain unchanged. No private fork or manual model patch is required.
 
 Use official `inclusionAI/Ling-3.0-tiny` revision
 `9a98e35fe1c9ee255f78dd64771c7ae15a799481` (modeling SHA256
@@ -9,6 +9,8 @@ Adapter installation is restricted to the tiny configuration; other Ling variant
 keep their existing non-packing implementation and reject unsupported packing.
 
 The validated dependency lane is Transformers 4.57.1, PyTorch 2.9.0, torch_npu 2.9.0.post6, CANN 9.1.0, Triton 3.2.0, triton-ascend 3.2.2, Accelerate 1.14.0, PEFT 0.20.0, and official FLA revision `35dceaee5408e69a555fec34cb215c93c375dabe`. This example does not install dependencies. Transformers 5.x is outside this change's validated scope.
+
+Before changing attention forwards, the installer checks Transformers 4.57.1 and the required legacy FLA convolution and KDA callable interfaces. If these are unavailable, ordinary model loading keeps its upstream implementation and emits a warning: this does not certify MLA causality, padding, or short-sequence training. Explicit unsupported packing fails with the required dependency lane. Interface checks do not establish correctness for arbitrary unpinned FLA revisions.
 
 Activate a compatible environment and set:
 
@@ -35,11 +37,13 @@ Set `PACKING=true` to use packed documents, with optional `PACKING_LENGTH=2048`.
 
 Disabling activation checkpointing requires more memory. Choose this example's profile only when the memory budget permits it; no speed or training-quality guarantee is made. No MoE dispatch optimization or Task Queue override is included.
 
-Ordinary padded KDA is supported only in cache-free chunk-mode training. Padded decoding/cache, empty sequences, internal mask gaps, conflicting packed metadata, and MTP combinations are outside the supported contract. Unsupported inputs fail explicitly.
+Ordinary padded KDA supports cache-free chunk-mode training and evaluation. Set `use_cache=False` explicitly for evaluation when the configuration defaults to caching. An omitted or `None` value follows the layer configuration; a historical state or a request to cache is rejected. Padded decoding/cache, empty sequences, internal mask gaps, conflicting packed metadata, and MTP combinations remain outside the supported contract.
 
 The saved full-model BF16 padding comparison had a B1/B2 loss delta of 0.0664996624, above its frozen 0.02 budget. Local KDA/MLA padding isolation and a real 10-step padding SFT passed, but they do not establish strict numerical equivalence or explain the entire loss difference. The original numerical BAD verdict is retained. Device regression of this rebased and simplified candidate has not been run. Historical runs do not certify this diff.
 
 `python tests/models/test_ling3_compat.py` runs portable CPU adapter tests without model files or FLA kernels. For the additional official-source lifecycle and checkpoint regression, set `LING3_MODEL_SOURCE` to a local official model source directory and run `python tests/models/test_ling3_packing.py`. That optional suite explicitly skips when no source is supplied; it does not download or load weights. Actual FLA, NPU, and FSDP2 validation requires separate device tests.
+
+`python tests/models/test_ling3_maintainer_fixes.py` adds CPU fixture contracts for dependency preflight, loader preservation, cache-free padded evaluation, and test-module isolation. Supply `LING3_MODEL_SOURCE` for its same-process packing-suite check. These stubs and oracles do not execute real FLA kernels or certify device training/evaluation.
 
 This compatibility lane uses the official remote-code `BailingMoeV3ForCausalLM`,
 not the native Transformers `BailingHybridForCausalLM` implementation for Flash.

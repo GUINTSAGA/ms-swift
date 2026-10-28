@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from functools import wraps
 from importlib import import_module
+from inspect import signature
 
 _PACKING_KEYS = ('cu_seq_lens_q', 'cu_seq_lens_k', 'max_length_q', 'max_length_k', 'cu_seqlens')
 
@@ -91,9 +92,7 @@ def _singleton_forward(original, causal_conv1d):
     return forward
 
 
-def patch_short_convolution(conv):
-    from fla.modules.conv.causal_conv1d import causal_conv1d
-
+def patch_short_convolution(conv, causal_conv1d):
     from ..patcher import patch_module_forward
     if getattr(conv, '_swift_ling3_singleton', False):
         return
@@ -188,8 +187,11 @@ def _mla_forward(self,
 
 def _padded_kda_forward(self, hidden_states, attention_mask, past_key_value, position_ids, *, chunk_kda, **kwargs):
     # Ordinary padding only. Packing metadata remains on the original path.
-    if not self.training or past_key_value is not None or kwargs.get('use_cache'):
-        raise ValueError('Ling3 padded KDA supports cache-free training only')
+    use_cache = kwargs.get('use_cache')
+    if use_cache is None:
+        use_cache = getattr(getattr(self, 'config', None), 'use_cache', False)
+    if past_key_value is not None or use_cache:
+        raise ValueError('Ling3 padded KDA requires use_cache=False and no historical cache')
     if any(kwargs.get(k) is not None for k in _PACKING_KEYS) or kwargs.get('cp_context') is not None:
         raise ValueError('Ling3 ordinary padding cannot be combined with packing/context parallel metadata')
     if self.mode != 'chunk':
@@ -306,6 +308,44 @@ def _make_kda_forward(original, chunk_kda):
     return forward
 
 
+def _get_ling3_compat_kernel(modeling):
+    from transformers import __version__
+
+    if __version__ != '4.57.1':
+        return None, 'Ling3 attention adapters are validated with Transformers 4.57.1 only'
+    try:
+        from fla.modules.conv.causal_conv1d import causal_conv1d
+        signature(causal_conv1d).bind(
+            x=None,
+            weight=None,
+            bias=None,
+            residual=None,
+            initial_state=None,
+            output_final_state=False,
+            activation=None,
+            backend='triton',
+            cu_seqlens=None,
+            chunk_indices=None)
+        signature(modeling.chunk_kda).bind(
+            q=None,
+            k=None,
+            v=None,
+            g=None,
+            beta=None,
+            A_log=None,
+            dt_bias=None,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            safe_gate=True,
+            lower_bound=-5.0,
+            cu_seqlens=None)
+    except (ImportError, AttributeError, TypeError, ValueError) as error:
+        return None, f'Ling3 attention adapters require the official FLA 35dceaee interfaces: {error}'
+    return causal_conv1d, None
+
+
 def install_ling3_compat(model):
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
@@ -319,7 +359,10 @@ def install_ling3_compat(model):
     modeling = import_module(type(model).__module__)
     if not callable(getattr(modeling, 'apply_rotary_pos_emb_interleave', None)) or not callable(
             getattr(modeling, 'chunk_kda', None)):
-        raise ValueError('Ling3 model does not expose the required rotary/KDA operators')
+        return 'Ling3 model does not expose the required rotary/KDA operators'
+    causal_conv1d, error = _get_ling3_compat_kernel(modeling)
+    if error is not None:
+        return error
     pending = []
     for layer in model.model.layers:
         attention = layer.attention
@@ -338,13 +381,17 @@ def install_ling3_compat(model):
             raise NotImplementedError(f'Unknown Ling3 attention type: {layer.attention_layer_type}')
         if not all(hasattr(attention, name) for name in required):
             raise ValueError('Ling3 attention is missing required projection/kernel capabilities')
+        if layer.attention_layer_type == 'linear_attention':
+            for name in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
+                conv = getattr(attention, name)
+                if getattr(conv, '_patched', False) and not getattr(conv, '_swift_ling3_singleton', False):
+                    raise ValueError('Ling3 ShortConvolution already has a conflicting patch')
         pending.append((attention, forward))
     for layer in model.model.layers:
         if layer.attention_layer_type == 'linear_attention':
             for name in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-                patch_short_convolution(getattr(layer.attention, name))
+                patch_short_convolution(getattr(layer.attention, name), causal_conv1d)
     for attention, forward in pending:
-        attention._swift_ling3_origin_forward = getattr(attention, '_old_forward', attention.forward)
         patch_module_forward(attention, forward)
     model.model._supports_packing_metadata = True
     model._swift_ling3_compat = {

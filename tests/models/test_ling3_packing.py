@@ -11,6 +11,7 @@ import unittest
 from functools import partial
 from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 os.environ['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
@@ -59,7 +60,18 @@ helper = method(SWIFT / 'swift/utils/transformers_utils.py', None, 'get_packed_s
 # Stub only package imports; production module itself runs directly on CPU.
 utils = ModuleType('swift.utils')
 utils.get_packed_seq_params = helper
-sys.modules['swift.utils'] = utils
+
+
+def setUpModule():
+    utils_patch = patch.dict(sys.modules, {'swift.utils': utils})
+    unittest.addModuleCleanup(utils_patch.stop)
+    utils_patch.start()
+
+
+def tearDownModule():
+    unittest.doModuleCleanups()
+
+
 spec = importlib.util.spec_from_file_location('candidate_ling3', SWIFT / 'swift/model/models/ling3_compat.py')
 compat = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(compat)

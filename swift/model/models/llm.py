@@ -377,7 +377,7 @@ register_model(
 class BailingHybridLoader(ModelLoader):
 
     @staticmethod
-    def _patch_ling3_packing(model):
+    def _patch_ling3_packing(model, compat_error=None):
         import inspect
         import torch
 
@@ -406,7 +406,8 @@ class BailingHybridLoader(ModelLoader):
                 raise ValueError('Ling3 packing requires cu_seq_lens_q/k and max_length_q/k together.')
             if not getattr(getattr(module, 'model', module), '_supports_packing_metadata', False):
                 raise ValueError(
-                    'Ling3 model code does not support packing metadata; install the Swift Ling3 attention adapters.')
+                    f'Ling3 packing is unavailable: {compat_error or "the model has no packing adapters"}. '
+                    'Use Transformers 4.57.1 and official FLA revision 35dceaee5408e69a555fec34cb215c93c375dabe.')
             if module.config._attn_implementation != 'flash_attention_2':
                 raise ValueError('Ling3 packing requires the native flash_attention_2 varlen backend.')
             use_cache = call_kwargs.get('use_cache')
@@ -503,9 +504,13 @@ class BailingHybridLoader(ModelLoader):
         if 'BailingMoeV3ForCausalLM' in (getattr(config, 'architectures', None) or []):
             from .ling3_compat import install_ling3_compat, is_ling3_tiny
 
+            compat_error = None
             if is_ling3_tiny(config) and not getattr(config, 'num_nextn_predict_layers', 0):
-                install_ling3_compat(model)
-            self._patch_ling3_packing(model)
+                compat_error = install_ling3_compat(model)
+                if compat_error is not None:
+                    logger.warning(f'{compat_error}. Keeping upstream non-packing behavior; '
+                                   'MLA causality, padding and short-sequence training are not certified on this path.')
+            self._patch_ling3_packing(model, compat_error)
         return model
 
 

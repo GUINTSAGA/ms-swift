@@ -173,7 +173,7 @@ class AdapterTests(unittest.TestCase):
             self.assertIs(conv.calls[0], calls[0]['cu_seqlens'])
 
     def test_padding_rejects_invalid_contracts(self):
-        for mutation in ('internal', 'empty', 'binary', 'positions', 'cache', 'eval', 'mode', 'packing'):
+        for mutation in ('internal', 'empty', 'binary', 'positions', 'cache', 'mode', 'packing'):
             with self.subTest(mutation=mutation):
                 m, kernel, _ = kda()
                 mask, pos = padded('right')
@@ -188,8 +188,6 @@ class AdapterTests(unittest.TestCase):
                     pos[0, 1] = 7
                 if mutation == 'cache':
                     kw['past_key_value'] = object()
-                if mutation == 'eval':
-                    m.eval()
                 if mutation == 'mode':
                     m.mode = 'fused_recurrent'
                 if mutation == 'packing':
@@ -324,6 +322,7 @@ class AdapterTests(unittest.TestCase):
                       'fla.modules.conv.causal_conv1d')
         }
         modules['swift.model.patcher'].patch_module_forward = ns['patch_module_forward']
+        modules['transformers'].__version__ = '4.57.1'
         modules['transformers.modeling_utils'].ALL_ATTENTION_FUNCTIONS = {'sdpa': object()}
         modules['fla.modules.conv.causal_conv1d'].causal_conv1d = lambda **kw: (kw['x'], None)
 
