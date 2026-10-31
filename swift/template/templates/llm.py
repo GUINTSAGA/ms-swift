@@ -499,6 +499,7 @@ register_template(
 class Ling3Template(Template):
 
     def _data_collator(self, batch, **kwargs):
+        """Expose Swift reset-position boundaries to the remote attention layers."""
         from swift.utils import get_packed_seq_params
 
         res = super()._data_collator(batch, **kwargs)

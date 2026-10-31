@@ -1,5 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Ling3 packing, padding and short-sequence training adapters."""
+"""Adapt the official Ling3 tiny remote code without changing its parameter layout.
+
+Both certified Transformers versions share attention and KDA adapters. Construction
+metadata and RoPE lifecycle differences are isolated in ``ling3_rope``.
+"""
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -17,6 +21,7 @@ def is_ling3_tiny(config):
 
 
 def _packed_params(hidden_states, position_ids, attention_mask, kwargs):
+    """Rebuild boundaries locally, including direct calls and checkpoint recomputation."""
     supplied = {k: kwargs[k] for k in _PACKING_KEYS if kwargs.get(k) is not None}
     if position_ids is None:
         if supplied:
@@ -33,12 +38,19 @@ def _packed_params(hidden_states, position_ids, attention_mask, kwargs):
     if attention_mask is not None and (attention_mask.ndim != 2 or not bool((attention_mask == 1).all())):
         if supplied:
             raise ValueError('Ling3 packing does not support real padding or 4-D masks')
+        if attention_mask.ndim == 4 and bool(((position_ids[:, :-1] > 0) & (position_ids[:, 1:] == 0)).any()):
+            keep = (
+                attention_mask[..., -1, :] if attention_mask.dtype == torch.bool else attention_mask[..., -1, :] > -1e4)
+            if bool(keep.all()):
+                raise ValueError('Ling3 packed position_ids require explicit sequence metadata.')
         # Preserve ordinary padded inputs; do not interpret padding zeros as documents.
         return {}
     consecutive = (position_ids[:, 1:] == 0) | (position_ids.diff(dim=-1) == 1)
     if int(position_ids[0, 0]) != 0 or bool((position_ids < 0).any()) or not bool(consecutive.all()):
         raise ValueError('Ling3 packed positions must reset to zero and increase consecutively')
     from swift.utils import get_packed_seq_params
+
+    # Use Swift's canonical metadata, rather than trusting supplied boundaries.
     params = get_packed_seq_params(position_ids)
     for name, value in supplied.items():
         expected = params['cu_seq_lens_q'] if name == 'cu_seqlens' else params[name]
@@ -52,6 +64,7 @@ def _packed_params(hidden_states, position_ids, attention_mask, kwargs):
 
 
 def _singleton_forward(original, causal_conv1d):
+    """Keep singleton training on the differentiable convolution path of the pinned FLA."""
 
     @wraps(getattr(original, '__func__', original))
     def forward(self,
@@ -93,6 +106,7 @@ def _singleton_forward(original, causal_conv1d):
 
 
 def patch_short_convolution(conv, causal_conv1d):
+    """Install the singleton adapter once, without replacing parameter objects."""
     from ..patcher import patch_module_forward
     if getattr(conv, '_swift_ling3_singleton', False):
         return
@@ -101,6 +115,24 @@ def patch_short_convolution(conv, causal_conv1d):
     original = getattr(conv, '_old_forward', conv.forward)
     patch_module_forward(conv, _singleton_forward(original, causal_conv1d))
     conv._swift_ling3_singleton = True
+
+
+def _validate_eager_causal_mask(hidden_states, mask):
+    """Require an additive causal mask; a keep mask alone cannot prevent leakage."""
+    batch, length = hidden_states.shape[:2]
+    if mask is None:
+        if length > 1:
+            raise ValueError('Ling3 eager MLA requires an explicit causal mask')
+        return
+    if (mask.ndim != 4 or mask.shape[0] not in (1, batch) or mask.shape[-2] != length or mask.shape[-1] < length
+            or not mask.is_floating_point() or mask.device != hidden_states.device):
+        raise ValueError('Ling3 eager MLA requires an aligned floating-point 4-D additive causal mask')
+    keys = mask.shape[-1]
+    future = torch.arange(
+        keys, device=mask.device)[None, :] > (
+            torch.arange(length, device=mask.device)[:, None] + keys - length)
+    if bool((mask[..., future] > torch.finfo(mask.dtype).min).any()) or bool(torch.isnan(mask).any()):
+        raise ValueError('Ling3 eager MLA mask must block every future token')
 
 
 def _mla_forward(self,
@@ -126,8 +158,7 @@ def _mla_forward(self,
     if params and backend != 'flash_attention_2':
         raise ValueError('Ling3 packed MLA requires flash_attention_2 varlen')
     if backend == 'eager':
-        if attention_mask is None and hidden_states.shape[1] > 1:
-            raise ValueError('Ling3 eager MLA requires an explicit causal mask')
+        _validate_eager_causal_mask(hidden_states, attention_mask)
         return original(
             hidden_states,
             position_embeddings,
@@ -136,6 +167,8 @@ def _mla_forward(self,
             cache_position=cache_position,
             position_ids=position_ids,
             **kwargs)
+    # Native registry backends use this module's is_causal flag. Eager instead
+    # requires the explicit-mask guard above.
     interface = registry[backend]
     batch, length = hidden_states.shape[:2]
     q_shape = (batch, length, -1, self.qk_head_dim)
@@ -187,6 +220,7 @@ def _mla_forward(self,
 
 def _padded_kda_forward(self, hidden_states, attention_mask, past_key_value, position_ids, *, chunk_kda, **kwargs):
     # Ordinary padding only. Packing metadata remains on the original path.
+    """Gather valid tokens into independent sequences and scatter outputs back."""
     use_cache = kwargs.get('use_cache')
     if use_cache is None:
         use_cache = getattr(getattr(self, 'config', None), 'use_cache', False)
@@ -223,6 +257,8 @@ def _padded_kda_forward(self, hidden_states, attention_mask, past_key_value, pos
             if not torch.equal(position_ids[mask], logical[mask]):
                 raise ValueError('Ling3 padding position_ids disagree with valid-token logical positions')
     batch, length, width = hidden_states.shape
+    # cu_seqlens resets convolution and recurrent state between rows.
+    # Internal gaps and cache would make this compacted sequence ambiguous.
     indices = mask.reshape(-1).nonzero().flatten()
     hidden_states = hidden_states.reshape(-1, width).index_select(0, indices).unsqueeze(0)
     cu = torch.cat((lengths.new_zeros(1), lengths.cumsum(0))).contiguous()
@@ -232,6 +268,7 @@ def _padded_kda_forward(self, hidden_states, attention_mask, past_key_value, pos
 
 
 def _kda_chunk_forward(self, hidden_states, cu, *, chunk_kda):
+    """Share pinned chunk math between short and padded cache-free inputs."""
     q, _ = self.q_conv1d(x=self.q_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu)
     k, _ = self.k_conv1d(x=self.k_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu)
     v, _ = self.v_conv1d(x=self.v_proj(hidden_states), cache=None, output_final_state=False, cu_seqlens=cu)
@@ -277,6 +314,8 @@ def _kda_forward(self,
         raise ValueError('Ling3 packed KDA does not support historical cache')
     if params:
         kwargs['cu_seqlens'] = params['cu_seq_lens_q']
+    # Remote KDA selects fused recurrent at length <=64, even in training.
+    # Use chunk math for autograd; preserve the other routes.
     if not self.training or hidden_states.shape[1] > 64 or past_key_value is not None:
         return original(
             hidden_states,
@@ -309,10 +348,11 @@ def _make_kda_forward(original, chunk_kda):
 
 
 def _get_ling3_compat_kernel(modeling):
+    """Check callable contracts before mutation; return a reason when unavailable."""
     from transformers import __version__
 
-    if __version__ != '4.57.1':
-        return None, 'Ling3 attention adapters are validated with Transformers 4.57.1 only'
+    if __version__ not in ('4.57.1', '5.14.1'):
+        return None, 'Ling3 attention adapters are validated with Transformers 4.57.1 and 5.14.1 only'
     try:
         from fla.modules.conv.causal_conv1d import causal_conv1d
         signature(causal_conv1d).bind(
@@ -347,8 +387,7 @@ def _get_ling3_compat_kernel(modeling):
 
 
 def install_ling3_compat(model):
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
+    """Preflight all layers, then install instance forwards with rollback on failure."""
     from ..patcher import patch_module_forward
     if getattr(model, '_swift_ling3_compat', None):
         return
@@ -363,6 +402,15 @@ def install_ling3_compat(model):
     causal_conv1d, error = _get_ling3_compat_kernel(modeling)
     if error is not None:
         return error
+    try:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        for layer in model.model.layers:
+            if layer.attention_layer_type == 'attention':
+                backend = layer.attention.config._attn_implementation
+                if backend != 'eager' and not callable(ALL_ATTENTION_FUNCTIONS[backend]):
+                    return f'Ling3 attention backend {backend} is not callable'
+    except (ImportError, AttributeError, KeyError, TypeError) as error:
+        return f'Ling3 attention registry is unavailable: {error}'
     pending = []
     for layer in model.model.layers:
         attention = layer.attention
@@ -387,13 +435,27 @@ def install_ling3_compat(model):
                 if getattr(conv, '_patched', False) and not getattr(conv, '_swift_ling3_singleton', False):
                     raise ValueError('Ling3 ShortConvolution already has a conflicting patch')
         pending.append((attention, forward))
+    modules = [model, model.model]
     for layer in model.model.layers:
+        modules.append(layer.attention)
         if layer.attention_layer_type == 'linear_attention':
-            for name in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
-                patch_short_convolution(getattr(layer.attention, name), causal_conv1d)
-    for attention, forward in pending:
-        patch_module_forward(attention, forward)
-    model.model._supports_packing_metadata = True
-    model._swift_ling3_compat = {
-        'policy': 'attention-local-position-boundaries; native MLA dispatch; short training chunk'
-    }
+            modules.extend(getattr(layer.attention, name) for name in ('q_conv1d', 'k_conv1d', 'v_conv1d'))
+    # Swift's patcher changes instance attributes only. Restore those attributes
+    # if installation fails, so a model cannot remain partially adapted.
+    snapshots = [(module, dict(module.__dict__)) for module in modules]
+    try:
+        for layer in model.model.layers:
+            if layer.attention_layer_type == 'linear_attention':
+                for name in ('q_conv1d', 'k_conv1d', 'v_conv1d'):
+                    patch_short_convolution(getattr(layer.attention, name), causal_conv1d)
+        for attention, forward in pending:
+            patch_module_forward(attention, forward)
+        model.model._supports_packing_metadata = True
+        model._swift_ling3_compat = {
+            'policy': 'attention-local-position-boundaries; native MLA dispatch; short training chunk'
+        }
+    except Exception:
+        for module, state in snapshots:
+            module.__dict__.clear()
+            module.__dict__.update(state)
+        raise

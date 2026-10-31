@@ -378,6 +378,11 @@ class BailingHybridLoader(ModelLoader):
 
     @staticmethod
     def _patch_ling3_packing(model, compat_error=None):
+        """Validate collator metadata before the remote model discards its keep mask.
+
+        Attention modules also validate boundaries locally: direct module calls
+        and activation-checkpoint recomputation can bypass this outer hook.
+        """
         import inspect
         import torch
 
@@ -401,13 +406,22 @@ class BailingHybridLoader(ModelLoader):
                         and (mask is None or (mask.ndim == 2 and bool((mask == 1).all()))) and bool(
                             (position_ids[:, 1:] == 0).any())):
                     raise ValueError('Ling3 packed position_ids require explicit sequence metadata.')
+                if (position_ids is not None and position_ids.ndim == 2 and position_ids.shape[0] == 1
+                        and mask is not None and mask.ndim == 4 and bool(
+                            ((position_ids[:, :-1] > 0) & (position_ids[:, 1:] == 0)).any())):
+                    # Follow the remote decoder's last-query padding interpretation.
+                    # Do not classify ordinary 4-D padding as packed documents.
+                    keep = mask[..., -1, :] if mask.dtype == torch.bool else mask[..., -1, :] > -1e4
+                    if bool(keep.all()):
+                        raise ValueError('Ling3 packed position_ids require explicit sequence metadata.')
                 return args, kwargs
             if any(call_kwargs.get(key) is None for key in fields):
                 raise ValueError('Ling3 packing requires cu_seq_lens_q/k and max_length_q/k together.')
             if not getattr(getattr(module, 'model', module), '_supports_packing_metadata', False):
                 raise ValueError(
                     f'Ling3 packing is unavailable: {compat_error or "the model has no packing adapters"}. '
-                    'Use Transformers 4.57.1 and official FLA revision 35dceaee5408e69a555fec34cb215c93c375dabe.')
+                    'Use Transformers 4.57.1 or 5.14.1 and official FLA revision 35dceaee5408e69a555fec34cb215c93c375dabe.'
+                )
             if module.config._attn_implementation != 'flash_attention_2':
                 raise ValueError('Ling3 packing requires the native flash_attention_2 varlen backend.')
             use_cache = call_kwargs.get('use_cache')
@@ -495,12 +509,20 @@ class BailingHybridLoader(ModelLoader):
 
                 import_utils.is_torch_fx_available = is_torch_fx_available
             rope_scaling = getattr(config, 'rope_scaling', None)
-            if isinstance(rope_scaling, dict) and 'factor' not in rope_scaling:
+            from transformers import __version__
+            if __version__ == '4.57.1' and isinstance(rope_scaling, dict) and 'factor' not in rope_scaling:
                 rope_scaling['factor'] = 1.0
                 rope_scaling['rope_type'] = 'linear'
             if getattr(config, 'num_nextn_predict_layers', 0) > 0:
                 self._patch_dynamic_cache_auto_extend()
-        model = super().get_model(model_dir, config, processor, model_kwargs)
+        if 'BailingMoeV3ForCausalLM' in (getattr(config, 'architectures', None) or []):
+            from .ling3_rope import ling3_rope_construction
+            with ling3_rope_construction(model_dir, config, model_kwargs) as finalize:
+                model = super().get_model(model_dir, config, processor, model_kwargs)
+                if finalize is not None:
+                    finalize(model)
+        else:
+            model = super().get_model(model_dir, config, processor, model_kwargs)
         if 'BailingMoeV3ForCausalLM' in (getattr(config, 'architectures', None) or []):
             from .ling3_compat import install_ling3_compat, is_ling3_tiny
 

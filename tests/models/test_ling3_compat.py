@@ -323,7 +323,7 @@ class AdapterTests(unittest.TestCase):
         }
         modules['swift.model.patcher'].patch_module_forward = ns['patch_module_forward']
         modules['transformers'].__version__ = '4.57.1'
-        modules['transformers.modeling_utils'].ALL_ATTENTION_FUNCTIONS = {'sdpa': object()}
+        modules['transformers.modeling_utils'].ALL_ATTENTION_FUNCTIONS = {'sdpa': lambda *args, **kwargs: None}
         modules['fla.modules.conv.causal_conv1d'].causal_conv1d = lambda **kw: (kw['x'], None)
 
         class Shell(nn.Module):

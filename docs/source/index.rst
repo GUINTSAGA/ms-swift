@@ -75,6 +75,7 @@ Swift DOCUMENTATION
    BestPractices/Reranker.md
    BestPractices/Decision.md
    BestPractices/Rapidly-Training-VL-model.md
+   BestPractices/Ling3.md
    BestPractices/NPU-support.md
    BestPractices/Metax-support.md
    BestPractices/AMD-support.md
