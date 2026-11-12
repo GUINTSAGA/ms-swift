@@ -15,6 +15,7 @@ from unittest.mock import patch
 os.environ.setdefault('TORCH_DEVICE_BACKEND_AUTOLOAD', '0')
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
+from ling3_remote_forward_fixture import remote_forward  # noqa: E402
 from torch import nn  # noqa: E402
 from torch.utils.checkpoint import checkpoint  # noqa: E402
 
@@ -108,22 +109,19 @@ class MLA(nn.Module):
         self.attention_dropout = 0.
         self.g_proj = None
         self.dense = nn.Linear(4, 8, bias=False)
+        self._old_forward = MethodType(remote_forward, self)
+
+        self._adapted_forward = MethodType(
+            compat._make_mla_forward(self._old_forward, {'sdpa': self.cpu_attention}), self)
+
+    @staticmethod
+    def cpu_attention(module, q, k, v, attention_mask, **kw):
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attention_mask, is_causal=attention_mask is None, scale=kw['scaling']).transpose(1,
+                                                                                                                2), None
 
     def forward(self, x, mask=None, **kwargs):
-
-        def cpu_attention(module, q, k, v, attention_mask, **kw):
-            return F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attention_mask, is_causal=attention_mask is None,
-                scale=kw['scaling']).transpose(1, 2), None
-
-        return compat._mla_forward(
-            self,
-            x, (None, None),
-            mask,
-            original=lambda *a, **k: None,
-            rotary=lambda q, k, c, s: (q, k),
-            registry={'sdpa': cpu_attention},
-            **kwargs)
+        return self._adapted_forward(x, (None, None), mask, **kwargs)
 
 
 @contextmanager
@@ -380,7 +378,11 @@ class AdapterTests(unittest.TestCase):
                       'fla.modules.conv.causal_conv1d', 'swift.model.models.ling3_rope')
         }
         modules['swift.model.patcher'].patch_module_forward = ns['patch_module_forward']
-        modules['swift.model.models.ling3_rope'].SUPPORTED_TRANSFORMERS = ('4.57.1', '5.14.1')
+        rope_spec = importlib.util.spec_from_file_location('ling3_rope_fixture',
+                                                           ROOT / 'swift/model/models/ling3_rope.py')
+        rope_fixture = importlib.util.module_from_spec(rope_spec)
+        rope_spec.loader.exec_module(rope_fixture)
+        modules['swift.model.models.ling3_rope'].transformers_compatibility = rope_fixture.transformers_compatibility
         modules['transformers'].__version__ = '4.57.1'
         modules['transformers.modeling_utils'].ALL_ATTENTION_FUNCTIONS = {'sdpa': lambda *args, **kwargs: None}
         modules['fla.modules.conv.causal_conv1d'].causal_conv1d = lambda **kw: (kw['x'], None)

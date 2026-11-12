@@ -75,7 +75,8 @@ def dependencies(version='4.57.1', missing=False, bad_conv=False):
     modules['swift.model.patcher'].patch_module_forward = ns['patch_module_forward']
     modules['swift.model.models.ling3_compat'] = compat
     rope = ModuleType('swift.model.models.ling3_rope')
-    rope.SUPPORTED_TRANSFORMERS = ('4.57.1', '5.14.1')
+    actual = load_test('test_ling3_rope').rope
+    rope.transformers_compatibility = actual.transformers_compatibility
     rope.ling3_rope_construction = lambda *args: nullcontext(None)
     modules[rope.__name__] = rope
     modules['transformers'].__version__ = version
@@ -207,7 +208,7 @@ class LoaderAndAdapterTests(unittest.TestCase):
                 self.assertIs(attention.forward, installed)
 
     def test_required_adapter_failure_stops_tiny_loading(self):
-        for options in ({'missing': True}, {'bad_conv': True}, {'version': '5.20.0'}):
+        for options in ({'missing': True}, {'bad_conv': True}, {'version': '6.0.0'}):
             with self.subTest(options=options), mock_modules(dependencies(**options)):
                 model = shell()
                 before = unmodified(model)
@@ -218,7 +219,7 @@ class LoaderAndAdapterTests(unittest.TestCase):
                 self.assertFalse(messages)
 
     def test_preflight_failure_has_no_partial_mutation(self):
-        for options in ({'missing': True}, {'bad_conv': True}, {'version': '5.20.0'}):
+        for options in ({'missing': True}, {'bad_conv': True}, {'version': '6.0.0'}):
             with self.subTest(options=options), mock_modules(dependencies(**options)):
                 model = shell()
                 before = unmodified(model)
@@ -317,6 +318,269 @@ class LoaderAndAdapterTests(unittest.TestCase):
             finally:
                 module.tearDownModule()
             self.assertIs(sys.modules['swift.utils'], sentinel)
+
+
+class TransformersCompatibilityTests(unittest.TestCase):
+
+    def test_version_warning_policy(self):
+        policy = load_test('test_ling3_rope').rope.transformers_compatibility
+        tree = ast.parse((ROOT / 'swift/utils/logger.py').read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'warning_once')
+        namespace = {'warning_set': set()}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), '<Swift warning_once>', 'exec'), namespace)
+        messages = []
+        logger = SimpleNamespace(warning=messages.append)
+        logger.warning_once = MethodType(namespace['warning_once'], logger)
+        utils = ModuleType('swift.utils')
+        utils.get_logger = lambda: logger
+        with mock_modules({'swift.utils': utils}):
+            for version in ('4.57.1', '5.14.1'):
+                policy(version, warn=True)
+            self.assertEqual(messages, [])
+            for _ in range(2):
+                self.assertEqual(policy('5.20.0', warn=True), 'tf5')
+            self.assertEqual(len(messages), 1)
+            self.assertIn('unverified', messages[0])
+            policy('5.21.0', warn=True)
+            self.assertEqual(len(messages), 2)
+        namespace['warning_set'].clear()
+        messages.clear()
+        modules = dependencies(version='5.20.0')
+        modules['swift.utils'] = utils
+        with mock_modules(modules):
+            for _ in range(2):
+                model = shell()
+                instance, _ = loader(model)
+                instance.get_model('.', model.config, None, {})
+        self.assertEqual(len(messages), 1)
+        for version in ('4.56.0', '6.0.0'):
+            with self.assertRaises(NotImplementedError):
+                policy(version)
+
+    def test_flash_retains_legacy_factor_and_mtp(self):
+        for version in ('4.57.1', '5.14.1', '5.20.0'):
+            with self.subTest(version=version), mock_modules(dependencies(version=version)):
+                model = shell()
+                model.config.hidden_size = 2560
+                model.config.num_hidden_layers = 42
+                model.config.q_lora_rank = None
+                model.config.num_nextn_predict_layers = 1
+                model.config.rope_scaling = {'rope_type': 'default'}
+                instance, _ = loader(model)
+                extensions = []
+                instance._patch_dynamic_cache_auto_extend = lambda: extensions.append(True)
+                with patch(
+                        'swift.model.models.ling3_rope.ling3_rope_construction',
+                        side_effect=AssertionError('Flash entered Tiny construction')):
+                    self.assertIs(instance.get_model('.', model.config, None, {}), model)
+                expected = {'rope_type': 'linear', 'factor': 1.0} if version == '4.57.1' else {'rope_type': 'default'}
+                self.assertEqual(model.config.rope_scaling, expected)
+                self.assertEqual(extensions, [True])
+                self.assertFalse(hasattr(model, '_swift_ling3_packing_handle'))
+                self.assertFalse(getattr(model, '_swift_ling3_compat', False))
+
+    def test_non_tiny_preserves_rope_scaling_outside_legacy_factor_case(self):
+        for version, original in (
+            ('5.14.1', {
+                'rope_type': 'default'
+            }),
+            ('5.20.0', {
+                'rope_type': 'default'
+            }),
+            ('4.57.1', {
+                'rope_type': 'linear',
+                'factor': 2.0
+            }),
+            ('5.14.1', {
+                'rope_type': 'linear',
+                'factor': 2.0
+            }),
+        ):
+            with self.subTest(version=version, original=original), mock_modules(dependencies(version=version)):
+                model = shell()
+                model.config.hidden_size = 2560
+                scaling = dict(original)
+                model.config.rope_scaling = scaling
+                instance, _ = loader(model)
+                self.assertIs(instance.get_model('.', model.config, None, {}), model)
+                self.assertIs(model.config.rope_scaling, scaling)
+                self.assertEqual(scaling, original)
+
+    def test_unknown_tf5_api_failure_remains_fatal(self):
+        with mock_modules(dependencies(version='5.20.0', missing=True)):
+            model = shell()
+            before = unmodified(model)
+            with self.assertRaises(RuntimeError):
+                compat.install_ling3_compat(model)
+            self.assertEqual(before, unmodified(model))
+
+
+class MLAWrapperContractTests(unittest.TestCase):
+
+    def test_verified_kda_avoids_repeated_keep_mask_reduction(self):
+        positions = torch.tensor([[0, 1, 0, 1]])
+        hidden = torch.randn(1, 4, 4)
+        mask = torch.ones(1, 4)
+        model, kernel, _ = base.kda()
+        record = compat._PackingRecord(positions, hidden, base.helper(positions), mask)
+        original_bool = torch.Tensor.__bool__
+        calls = []
+
+        def counted(value):
+            calls.append(value)
+            return original_bool(value)
+
+        with patch.object(torch.Tensor, '__bool__', counted):
+            actual = compat._kda_forward(
+                model,
+                hidden,
+                mask,
+                position_ids=positions,
+                original=lambda *a, **kw: None,
+                chunk_kda=kernel,
+                _swift_ling3_packing_record=record)[0]
+        self.assertEqual(calls, [])
+        with mock_modules({'swift.utils': SimpleNamespace(get_packed_seq_params=base.helper)}):
+            expected = compat._kda_forward(
+                model, hidden, mask, position_ids=positions, original=lambda *a, **kw: None, chunk_kda=kernel)[0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_packed_kda_rejects_changed_or_mutated_keep_mask(self):
+        positions = torch.tensor([[0, 1, 0, 1]])
+        hidden = torch.randn(1, 4, 4)
+        model, kernel, _ = base.kda()
+        for mutate in (False, True):
+            mask = torch.ones(1, 4)
+            record = compat._PackingRecord(positions, hidden, base.helper(positions), mask)
+            leaf_mask = mask if mutate else mask.clone()
+            leaf_mask[0, 0] = 0
+            with self.assertRaisesRegex(ValueError, 'all-valid leaf attention mask'):
+                compat._kda_forward(
+                    model,
+                    hidden,
+                    leaf_mask,
+                    position_ids=positions,
+                    original=None,
+                    chunk_kda=kernel,
+                    _swift_ling3_packing_record=record)
+
+    def test_forward_scoped_metadata_reaches_mla_varlen_dispatch(self):
+        boundaries = []
+
+        def varlen(module, q, k, v, mask, **kwargs):
+            cu = kwargs.get('cu_seq_lens_q')
+            cu = cu.tolist() if cu is not None else [0, q.shape[2]]
+            boundaries.append(cu)
+            output = torch.cat([
+                torch.nn.functional.scaled_dot_product_attention(
+                    q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], is_causal=True, scale=kwargs['scaling'])
+                for a, b in zip(cu, cu[1:])
+            ], 2)
+            return output.transpose(1, 2), None
+
+        class Model(nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Module()])
+                attention = base.MLA('flash_attention_2')
+                attention.forward = MethodType(
+                    compat._make_mla_forward(attention._old_forward, {'flash_attention_2': varlen}), attention)
+                self.model.layers[0].attention = attention
+                self.model._supports_packing_metadata = True
+                self.config = SimpleNamespace(
+                    num_nextn_predict_layers=0, _attn_implementation='flash_attention_2', use_cache=False)
+                compat.patch_ling3_packing(self)
+
+            def forward(self, inputs_embeds=None, position_ids=None, **kwargs):
+                # Deliberately drop kwargs, as the frozen remote call sites do.
+                return self.model.layers[0].attention(
+                    hidden_states=inputs_embeds,
+                    position_embeddings=(None, None),
+                    attention_mask=None,
+                    position_ids=position_ids)[0]
+
+        torch.manual_seed(57)
+        model = Model()
+        reference = Model()
+        reference.load_state_dict(model.state_dict())
+        positions = torch.tensor([[0, 1, 0, 1]])
+        x = torch.randn(1, 4, 8, requires_grad=True)
+        with mock_modules({'swift.utils': SimpleNamespace(get_packed_seq_params=base.helper)}):
+            with patch.object(compat, '_validate_packed_params', wraps=compat._validate_packed_params) as full:
+                output = model(inputs_embeds=x, position_ids=positions, **base.helper(positions))
+                self.assertEqual(full.call_count, 1)
+            self.assertEqual(boundaries[-1], [0, 2, 4])
+            other = torch.cat([
+                reference(inputs_embeds=x[:, a:b], position_ids=torch.arange(b - a)[None]) for a, b in ((0, 2), (2, 4))
+            ], 1)
+            torch.testing.assert_close(output, other, rtol=0, atol=0)
+            grad = torch.autograd.grad(output[:, 2:].sum(), x)[0]
+            self.assertEqual(float(grad[:, :2].abs().max()), 0.)
+        self.assertFalse(model.model.layers[0].attention._forward_pre_hooks)
+
+    def test_real_cache_and_legacy_alias(self):
+        from transformers.cache_utils import DynamicCache
+
+        torch.manual_seed(51)
+        module = base.MLA().eval()
+        module.layer_idx = 0
+        x = torch.randn(1, 4, 8)
+        full = module(x, position_ids=torch.arange(4)[None])[0]
+        for key in ('past_key_values', 'past_key_value'):
+            cache = DynamicCache()
+            prefix = module(x[:, :3], position_ids=torch.arange(3)[None], **{key: cache})[0]
+            last = module(
+                x[:, 3:],
+                torch.zeros(1, 1, 1, 4),
+                position_ids=torch.tensor([[3]]),
+                cache_position=torch.tensor([3]),
+                **{key: cache})[0]
+            torch.testing.assert_close(prefix, full[:, :3])
+            torch.testing.assert_close(last, full[:, 3:])
+            self.assertEqual(cache.get_seq_length(), 4)
+
+    def test_unknown_dispatch_and_decorator_rejected_before_install(self):
+        from functools import wraps
+        from ling3_remote_forward_fixture import remote_forward
+
+        def unsupported(self, hidden_states, **kwargs):
+            return hidden_states
+
+        with self.assertRaisesRegex(ValueError, 'dispatch'):
+            compat._make_mla_forward(unsupported, {})
+
+        @wraps(remote_forward)
+        def unknown(*args, **kwargs):
+            return remote_forward(*args, **kwargs)
+
+        with self.assertRaisesRegex(ValueError, 'decorator'):
+            compat._make_mla_forward(unknown, {})
+        from inspect import unwrap
+        from transformers.utils.deprecation import deprecate_kwarg
+
+        changed = deprecate_kwarg('different_name', new_name='past_key_values', version='4.58')(unwrap(remote_forward))
+        with self.assertRaisesRegex(ValueError, 'decorator arguments'):
+            compat._make_mla_forward(changed, {})
+
+    def test_wrapper_preserves_remote_globals_and_instance_state(self):
+        from inspect import unwrap
+        from ling3_remote_forward_fixture import remote_forward
+
+        raw = unwrap(remote_forward)
+        original = raw.__globals__['eager_attention_forward']
+        first = base.MLA().eval()
+        second = base.MLA().eval()
+        second.load_state_dict(first.state_dict())
+        before = {name: id(value) for name, value in first.named_parameters()}
+        x = torch.randn(1, 4, 8, requires_grad=True)
+        a = first(x, position_ids=torch.arange(4)[None])[0]
+        b = second(x, position_ids=torch.arange(4)[None])[0]
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+        a.sum().backward()
+        self.assertIs(raw.__globals__['eager_attention_forward'], original)
+        self.assertEqual(before, {name: id(value) for name, value in first.named_parameters()})
 
 
 if __name__ == '__main__':

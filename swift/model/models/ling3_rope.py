@@ -14,7 +14,26 @@ from types import MethodType
 
 TF4_VERSION = '4.57.1'
 TF5_VERSION = '5.14.1'
-SUPPORTED_TRANSFORMERS = (TF4_VERSION, TF5_VERSION)
+VALIDATED_TRANSFORMERS = (TF4_VERSION, TF5_VERSION)
+
+
+def transformers_compatibility(version, *, warn=False):
+    """Select the tested TF4 or capability-checked TF5 path for Tiny only."""
+    from packaging.version import Version
+
+    parsed = Version(version)
+    if parsed == Version(TF4_VERSION):
+        return 'tf4'
+    if parsed.major != 5:
+        raise NotImplementedError('Ling3 has only been verified with Transformers 4.57.1 and 5.14.1; '
+                                  'other Transformers 5.x versions may be attempted')
+    if warn and parsed not in (Version(value) for value in VALIDATED_TRANSFORMERS):
+        from swift.utils import get_logger
+
+        get_logger().warning_once(f'Ling3 Transformers {version} is unverified and may have compatibility risks; '
+                                  'attempting the TF5 path with API and model checks enabled.')
+    return 'tf5'
+
 
 _LING3_ROPE_CONSTRUCTION_LOCK = Lock()
 
@@ -31,14 +50,10 @@ def ling3_rope_construction(model_dir, config, model_kwargs):
     """
     import os
     import transformers
-    from packaging.version import Version
-
-    version = Version(transformers.__version__)
-    if version == Version(TF4_VERSION):
+    version = transformers_compatibility(transformers.__version__)
+    if version == 'tf4':
         yield None
         return
-    if version != Version(TF5_VERSION):
-        raise NotImplementedError('Ling3 RoPE compatibility has only been verified with Transformers 4.57.1 and 5.14.1')
     scaling = getattr(config, 'rope_scaling', None)
     if scaling is not None and not isinstance(scaling, dict):
         raise ValueError('Ling3 default RoPE requires a flat parameter dictionary or None')

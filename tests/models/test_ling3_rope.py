@@ -185,13 +185,13 @@ class RopeTests(unittest.TestCase):
                 with self.context():
                     pass
             setattr(self.config, field, before)
-        self.tf.__version__ = '5.20.0'
+        self.tf.__version__ = '6.0.0'
         with self.assertRaises(NotImplementedError):
             with self.context():
                 pass
 
     def test_unverified_version_precedes_invalid_rope_parameters(self):
-        self.tf.__version__ = '5.20.0'
+        self.tf.__version__ = '6.0.0'
         self.config.rope_scaling = 'invalid parameters must not mask the version error'
         with self.assertRaisesRegex(NotImplementedError, 'has only been verified with'):
             with self.context():
@@ -212,6 +212,23 @@ class RopeTests(unittest.TestCase):
             model = self.model_cls(self.config)
             finalize(model)
             self.assertFalse(model._supports_flash_attn)
+
+
+class RopeVersionCompatibilityTests(unittest.TestCase):
+    setUp = RopeTests.setUp
+    context = RopeTests.context
+
+    def test_unknown_tf5_constructs_with_capability_checks(self):
+        self.tf.__version__ = '5.20.0'
+        with self.context() as finalize:
+            finalize(self.model_cls(self.config))
+
+    def test_unknown_tf5_invalid_scaling_still_fails(self):
+        self.tf.__version__ = '5.20.0'
+        self.config.rope_scaling = 'invalid'
+        with self.assertRaises(ValueError):
+            with self.context():
+                pass
 
 
 if __name__ == '__main__':
