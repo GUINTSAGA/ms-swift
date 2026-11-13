@@ -343,6 +343,9 @@ class TransformersCompatibilityTests(unittest.TestCase):
             self.assertIn('unverified', messages[0])
             policy('5.21.0', warn=True)
             self.assertEqual(len(messages), 2)
+            self.assertEqual(policy('4.58.0', warn=True), 'tf4')
+            self.assertEqual(len(messages), 3)
+            self.assertIn('4.58.0', messages[-1])
         namespace['warning_set'].clear()
         messages.clear()
         modules = dependencies(version='5.20.0')
@@ -356,6 +359,32 @@ class TransformersCompatibilityTests(unittest.TestCase):
         for version in ('4.56.0', '6.0.0'):
             with self.assertRaises(NotImplementedError):
                 policy(version)
+
+    def test_official_flash_config_isolation(self):
+        # Loader-relevant fields from inclusionAI/Ling-3.0-flash at fcc60a52b34c69c6271d0ac8a8cb0815020b6a43.
+        flash = dict(
+            architectures=['BailingMoeV3ForCausalLM'],
+            hidden_size=2560,
+            num_hidden_layers=42,
+            q_lora_rank=None,
+            num_nextn_predict_layers=1,
+            rope_scaling=None)
+        # inclusionAI/Ling-3.0-tiny at 9a98e35fe1c9ee255f78dd64771c7ae15a799481.
+        tiny = SimpleNamespace(hidden_size=1536, num_hidden_layers=24, q_lora_rank=256)
+        self.assertTrue(compat.is_ling3_tiny(tiny))
+        self.assertFalse(compat.is_ling3_tiny(SimpleNamespace(**flash)))
+        for version in ('4.57.1', '5.14.1'):
+            with self.subTest(version=version), mock_modules(dependencies(version=version)):
+                model = shell()
+                vars(model.config).update(flash)
+                instance, _ = loader(model)
+                with patch.object(instance, '_patch_dynamic_cache_auto_extend') as extend, patch.object(
+                        compat, 'install_ling3_compat') as install, patch.object(compat, 'patch_ling3_packing') as pack:
+                    self.assertIs(instance.get_model('.', model.config, None, {}), model)
+                extend.assert_called_once_with()
+                install.assert_not_called()
+                pack.assert_not_called()
+                self.assertIsNone(model.config.rope_scaling)
 
     def test_flash_retains_legacy_factor_and_mtp(self):
         for version in ('4.57.1', '5.14.1', '5.20.0'):

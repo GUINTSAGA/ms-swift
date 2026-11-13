@@ -193,7 +193,7 @@ class RopeTests(unittest.TestCase):
     def test_unverified_version_precedes_invalid_rope_parameters(self):
         self.tf.__version__ = '6.0.0'
         self.config.rope_scaling = 'invalid parameters must not mask the version error'
-        with self.assertRaisesRegex(NotImplementedError, 'has only been verified with'):
+        with self.assertRaisesRegex(NotImplementedError, 'requires Transformers'):
             with self.context():
                 self.fail('unverified version entered construction')
         self.assertEqual(self.originals, (self.rotary.__init__, self.remote.BailingMoeV3MultiLatentAttention.__init__,

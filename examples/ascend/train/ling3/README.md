@@ -163,7 +163,7 @@ CPU 测试不执行真实 Ascend Kernel，完整训练还需在实际 NPU 环境
 
 - **模型范围**：当前训练适配面向官方 Ling-3.0-tiny，不包含其他 Bailing V3 模型。
 - **Transformers**：支持已验证的 4.57.1 和 5.14.1，使用默认 RoPE 配置。
-- **Gradient Checkpointing**：脚本默认关闭，可通过 `--gradient_checkpointing true` 开启。已在单卡验证 Reentrant 和 Non-reentrant 的前向与反向，双卡 FSDP2 三步训练验收使用 `GC=false`。
+- **Gradient Checkpointing**：脚本默认关闭。如果设备内存不足，可通过 `--gradient_checkpointing true` 开启。
 - **Checkpoint**：脚本默认 `save_only_model=true`，不保存完整的优化器和训练调度状态。如需完整恢复训练，应在训练开始前设置 `--save_only_model false`，并使用兼容的训练配置恢复。
 - **MTP**：当前示例不支持 MTP 训练。
 
