@@ -58,7 +58,7 @@ class _PackingRecord:
     def resolve(self, hidden_states, positions, kwargs):
         if (self.version is None or positions is not self.positions or positions is None
                 or positions._version != self.version or hidden_states is None
-                or tuple(hidden_states.shape[:2]) != self.shape):
+                or hidden_states.device != positions.device or tuple(hidden_states.shape[:2]) != self.shape):
             return None
         for key, version in self.versions.items():
             if version is None or self.params[key]._version != version:
@@ -504,7 +504,8 @@ def _make_mla_forward(original, registry):
         backend = module.config._attn_implementation
         return registry[backend](module, query, key, value, mask, **attention_kwargs)
 
-    # Copy the namespace, not the model's projections, RoPE, cache or gating math.
+    # The remote forward resolves eager_attention_forward from its globals.
+    # Rebind it in the clone without changing the upstream module or its math.
     local = FunctionType(raw.__code__, dict(raw.__globals__, eager_attention_forward=dispatch), raw.__name__,
                          raw.__defaults__, raw.__closure__)
     local.__kwdefaults__ = raw.__kwdefaults__

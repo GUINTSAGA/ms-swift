@@ -420,6 +420,18 @@ class AdapterTests(unittest.TestCase):
 
 class AttentionCompatContractTests(unittest.TestCase):
 
+    def test_packing_record_rejects_hidden_states_on_another_device(self):
+        positions = torch.tensor([[0, 1, 0, 1]])
+        hidden = torch.zeros(1, 4, 8)
+        params = helper(positions)
+        with mock_modules({'swift.utils': SimpleNamespace(get_packed_seq_params=helper)}):
+            validated = compat._validate_packed_params(hidden, positions, None, params)
+        record = compat._PackingRecord(positions, hidden, validated)
+        actual = compat._packed_params(hidden, positions, None, {'_swift_ling3_packing_record': record})
+        self.assertIs(actual['cu_seq_lens_q'], validated['cu_seq_lens_q'])
+        with self.assertRaisesRegex(ValueError, 'aligned with position_ids'):
+            compat._packed_params(hidden.to('meta'), positions, None, {'_swift_ling3_packing_record': record})
+
     def test_verified_kda_avoids_repeated_keep_mask_reduction(self):
         positions = torch.tensor([[0, 1, 0, 1]])
         hidden = torch.randn(1, 4, 4)
