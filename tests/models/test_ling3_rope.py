@@ -185,10 +185,15 @@ class RopeTests(unittest.TestCase):
                 with self.context():
                     pass
             setattr(self.config, field, before)
-        self.tf.__version__ = '6.0.0'
-        with self.assertRaises(NotImplementedError):
-            with self.context():
-                pass
+        for version in ('6.0.0rc1', '6.0.0'):
+            with self.subTest(version=version):
+                self.tf.__version__ = version
+                with self.assertRaisesRegex(NotImplementedError, 'requires Transformers'):
+                    with self.context():
+                        self.fail('unsupported version entered construction')
+                self.assertEqual(self.originals,
+                                 (self.rotary.__init__, self.remote.BailingMoeV3MultiLatentAttention.__init__,
+                                  self.base.__init__, self.model_cls._tied_weights_keys))
 
     def test_unverified_version_precedes_invalid_rope_parameters(self):
         self.tf.__version__ = '6.0.0'
