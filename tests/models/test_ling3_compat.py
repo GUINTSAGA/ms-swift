@@ -12,8 +12,8 @@ from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-os.environ.setdefault('TORCH_DEVICE_BACKEND_AUTOLOAD', '0')
-import torch  # noqa: E402
+with patch.dict(os.environ, {'TORCH_DEVICE_BACKEND_AUTOLOAD': '0'}):
+    import torch
 import torch.nn.functional as F  # noqa: E402
 from ling3_remote_forward_fixture import remote_forward  # noqa: E402
 from torch import nn  # noqa: E402
@@ -37,6 +37,10 @@ def apply_rotary_pos_emb_interleave(q, k, c, s):
 
 def chunk_kda(**kwargs):
     return kwargs['v'], None
+
+
+def setUpModule():
+    unittest.addModuleCleanup(torch.set_rng_state, torch.get_rng_state())
 
 
 class ConvSpy(nn.Module):
@@ -526,6 +530,7 @@ class AttentionCompatContractTests(unittest.TestCase):
             with patch.object(compat, '_validate_packed_params', wraps=compat._validate_packed_params) as full:
                 output = model(inputs_embeds=x, position_ids=positions, **helper(positions))
                 self.assertEqual(full.call_count, 1)
+            self.assertTrue(boundaries, 'MLA did not dispatch to the varlen backend')
             self.assertEqual(boundaries[-1], [0, 2, 4])
             other = torch.cat([
                 reference(inputs_embeds=x[:, a:b], position_ids=torch.arange(b - a)[None]) for a, b in ((0, 2), (2, 4))

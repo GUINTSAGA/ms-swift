@@ -10,8 +10,9 @@ from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-os.environ['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'
-import torch  # noqa: E402
+with patch.dict(os.environ, {'TORCH_DEVICE_BACKEND_AUTOLOAD': '0'}):
+    import torch
+
 from torch import nn  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +36,10 @@ mock_modules = base.mock_modules
 compat = base.compat
 apply_rotary_pos_emb_interleave = base.apply_rotary_pos_emb_interleave
 chunk_kda = base.chunk_kda
+
+
+def setUpModule():
+    unittest.addModuleCleanup(torch.set_rng_state, torch.get_rng_state())
 
 
 class Shell(nn.Module):
@@ -309,14 +314,16 @@ class LoaderAndAdapterTests(unittest.TestCase):
         with mock_modules({'swift.utils': sentinel}):
             module = load_test('test_ling3_packing')
             self.assertIs(sys.modules['swift.utils'], sentinel)
-            module.setUpModule()
-            try:
-                self.assertIs(sys.modules['swift.utils'], module.utils)
-                raise RuntimeError('expected fixture interruption')
-            except RuntimeError:
-                pass
-            finally:
-                module.tearDownModule()
+            cleanup = Mock()
+            unittest.addModuleCleanup(cleanup)
+            state = torch.get_rng_state()
+            with self.assertRaisesRegex(RuntimeError, 'expected fixture interruption'):
+                with torch.random.fork_rng(devices=[]), module.mock_modules({'swift.utils': module.utils}):
+                    self.assertIs(sys.modules['swift.utils'], module.utils)
+                    torch.rand(1)
+                    raise RuntimeError('expected fixture interruption')
+            cleanup.assert_not_called()
+            self.assertTrue(torch.equal(state, torch.get_rng_state()))
             self.assertIs(sys.modules['swift.utils'], sentinel)
 
 
@@ -347,6 +354,28 @@ class TransformersCompatibilityTests(unittest.TestCase):
         for version in ('4.56.0', '6.0.0'):
             with self.assertRaises(NotImplementedError):
                 policy(version)
+
+    def test_tiny_factor_routing(self):
+        for version, legacy in (('4.57.1', True), ('4.57.6', True), ('5.14.1', False), ('5.15.1', False)):
+            for kind in ('default', 'yarn'):
+                modules = dependencies(version=version)
+                modules['swift.utils'] = SimpleNamespace(get_logger=Mock())
+                with self.subTest(version=version, kind=kind), mock_modules(modules):
+                    model = shell()
+                    scaling = {'rope_type': kind}
+                    model.config.rope_scaling = scaling
+                    instance, _ = loader(model)
+                    self.assertIs(instance.get_model('.', model.config, None, {}), model)
+                    expected = {
+                        'rope_type': 'linear',
+                        'factor': 1.0
+                    } if legacy and kind == 'default' else {
+                        'rope_type': kind
+                    }
+                    self.assertIs(model.config.rope_scaling, scaling)
+                    self.assertEqual(scaling, expected)
+                    self.assertTrue(model._swift_ling3_compat)
+                    self.assertTrue(hasattr(model, '_swift_ling3_packing_handle'))
 
     def test_official_flash_config_isolation(self):
         # Loader-relevant fields from inclusionAI/Ling-3.0-flash at fcc60a52b34c69c6271d0ac8a8cb0815020b6a43.
@@ -390,7 +419,7 @@ class TransformersCompatibilityTests(unittest.TestCase):
                         'swift.model.models.ling3_rope.ling3_rope_construction',
                         side_effect=AssertionError('Flash entered Tiny construction')):
                     self.assertIs(instance.get_model('.', model.config, None, {}), model)
-                expected = {'rope_type': 'linear', 'factor': 1.0} if version == '4.57.1' else {'rope_type': 'default'}
+                expected = {'rope_type': 'linear', 'factor': 1.0}
                 self.assertEqual(model.config.rope_scaling, expected)
                 self.assertEqual(extensions, [True])
                 self.assertFalse(hasattr(model, '_swift_ling3_packing_handle'))
@@ -398,12 +427,6 @@ class TransformersCompatibilityTests(unittest.TestCase):
 
     def test_non_tiny_preserves_rope_scaling_outside_legacy_factor_case(self):
         for version, original in (
-            ('5.14.1', {
-                'rope_type': 'default'
-            }),
-            ('5.20.0', {
-                'rope_type': 'default'
-            }),
             ('4.57.1', {
                 'rope_type': 'linear',
                 'factor': 2.0

@@ -12,8 +12,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-os.environ.setdefault('TORCH_DEVICE_BACKEND_AUTOLOAD', '0')
-import torch  # noqa: E402
+with patch.dict(os.environ, {'TORCH_DEVICE_BACKEND_AUTOLOAD': '0'}):
+    import torch
 from torch import nn  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,6 +26,10 @@ ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('ling3_rope_cpu', ROOT / 'swift/model/models/ling3_rope.py')
 rope = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rope)
+
+
+def setUpModule():
+    unittest.addModuleCleanup(torch.set_rng_state, torch.get_rng_state())
 
 
 class RopeTests(unittest.TestCase):

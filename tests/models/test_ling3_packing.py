@@ -11,10 +11,11 @@ from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
+from unittest.mock import patch
 
-os.environ['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'
-os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
-import torch  # noqa: E402
+with patch.dict(os.environ, {'TORCH_DEVICE_BACKEND_AUTOLOAD': '0'}):
+    import torch
+
 import torch.nn.functional as F  # noqa: E402
 from einops import rearrange  # noqa: E402
 from torch import nn  # noqa: E402
@@ -60,6 +61,7 @@ utils.get_packed_seq_params = helper
 
 
 def setUpModule():
+    unittest.addModuleCleanup(torch.set_rng_state, torch.get_rng_state())
     stack = ExitStack()
     unittest.addModuleCleanup(stack.close)
     stack.enter_context(mock_modules({'swift.utils': utils}))
@@ -359,26 +361,6 @@ class PackingTests(unittest.TestCase):
         grad = torch.autograd.grad(a[:, 2:].sum(), x)[0]
         self.assertEqual(float(grad[:, :2].abs().max()), 0)
 
-    def test_native_metadata_loss_boundaries(self):
-        b = batch()
-        self.assertEqual(b['position_ids'].tolist(), [[0, 1, 2, 3, 0, 1, 2]])
-        self.assertEqual(b['cu_seq_lens_q'].tolist(), [0, 4, 7])
-        self.assertIs(b['cu_seq_lens_q'], b['cu_seq_lens_k'])
-        self.assertEqual(b['cu_seq_lens_q'].dtype, torch.int32)
-        self.assertEqual(int(b['max_length_q']), 4)
-        self.assertEqual(torch.roll(b['labels'], -1, -1)[0, 3].item(), -100)
-        self.assertEqual(torch.roll(b['labels'], -1, -1)[0, -1].item(), -100)
-        self.assertEqual(b['loss_scale'][0, 4].item(), 0)
-
-    def test_length_matrix_metadata(self):
-        for lengths in ((1, ), (1, 1, 1), (1, 3), (3, 1), (63, 64, 65), (127, 2)):
-            b = batch(lengths)
-            expected = [0]
-            for n in lengths:
-                expected.append(expected[-1] + n)
-            self.assertEqual(b['cu_seq_lens_q'].tolist(), expected)
-            self.assertEqual(int(b['max_length_q']), max(lengths))
-
     def test_actual_modified_call_chain_and_checkpoint(self):
         for reentrant in (None, False, True):
             model = CausalShell()
@@ -504,6 +486,29 @@ class PackingTests(unittest.TestCase):
             b.pop(k)
         with self.assertRaisesRegex(ValueError, 'explicit sequence metadata'):
             model(**b)
+
+
+class NativePackingCollatorTests(unittest.TestCase):
+
+    def test_native_metadata_loss_boundaries(self):
+        b = batch()
+        self.assertEqual(b['position_ids'].tolist(), [[0, 1, 2, 3, 0, 1, 2]])
+        self.assertEqual(b['cu_seq_lens_q'].tolist(), [0, 4, 7])
+        self.assertIs(b['cu_seq_lens_q'], b['cu_seq_lens_k'])
+        self.assertEqual(b['cu_seq_lens_q'].dtype, torch.int32)
+        self.assertEqual(int(b['max_length_q']), 4)
+        self.assertEqual(torch.roll(b['labels'], -1, -1)[0, 3].item(), -100)
+        self.assertEqual(torch.roll(b['labels'], -1, -1)[0, -1].item(), -100)
+        self.assertEqual(b['loss_scale'][0, 4].item(), 0)
+
+    def test_length_matrix_metadata(self):
+        for lengths in ((1, ), (1, 1, 1), (1, 3), (3, 1), (63, 64, 65), (127, 2)):
+            b = batch(lengths)
+            expected = [0]
+            for n in lengths:
+                expected.append(expected[-1] + n)
+            self.assertEqual(b['cu_seq_lens_q'].tolist(), expected)
+            self.assertEqual(int(b['max_length_q']), max(lengths))
 
 
 class PackingShell(nn.Module):
