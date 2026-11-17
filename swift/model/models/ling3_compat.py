@@ -7,7 +7,6 @@ metadata and RoPE lifecycle differences are isolated in ``ling3_rope``.
 import torch
 import torch.nn.functional as F
 from contextvars import ContextVar
-from dataclasses import dataclass
 from einops import rearrange
 from functools import wraps
 from importlib import import_module
@@ -24,26 +23,17 @@ def is_ling3_tiny(config):
                                                                          None)) == (1536, 24, 256)
 
 
-@dataclass(frozen=True, init=False, eq=False)
 class _PackingRecord:
-    """Call-owned boundaries; never stored on the model or reused across forwards."""
+    """Entry-validated boundaries owned by one forward; tensors are read-only by contract."""
 
     def __init__(self, positions, inputs, params, attention_mask=None):
-        object.__setattr__(self, 'positions', positions)
-        object.__setattr__(self, 'version',
-                           positions._version if positions is not None and not positions.is_inference() else None)
-        object.__setattr__(self, 'attention_mask', attention_mask)
-        object.__setattr__(
-            self, 'mask_version',
-            attention_mask._version if attention_mask is not None and not attention_mask.is_inference() else None)
-        object.__setattr__(self, 'shape', tuple(inputs.shape[:2]) if inputs is not None else None)
-        object.__setattr__(self, 'params', MappingProxyType(dict(params)))
-        object.__setattr__(
-            self, 'versions',
-            MappingProxyType({
-                key: value._version if not value.is_inference() else None
-                for key, value in params.items() if isinstance(value, torch.Tensor)
-            }))
+        self.positions = positions
+        self.version = None if positions.is_inference() else positions._version
+        self.shape = tuple(inputs.shape[:2])
+        self.params = MappingProxyType(params)
+        self.attention_mask = attention_mask
+        self.mask_version = (None
+                             if attention_mask is None or attention_mask.is_inference() else attention_mask._version)
 
     def check_mask(self, mask, positions):
         # FA2 can elide the entry's all-valid mask. A surviving mask must
@@ -60,19 +50,9 @@ class _PackingRecord:
                 or positions._version != self.version or hidden_states is None
                 or hidden_states.device != positions.device or tuple(hidden_states.shape[:2]) != self.shape):
             return None
-        for key, version in self.versions.items():
-            if version is None or self.params[key]._version != version:
-                return None
-        for key in _PACKING_KEYS:
-            value = kwargs.get(key)
-            if value is not None:
-                expected = self.params.get('cu_seq_lens_q' if key == 'cu_seqlens' else key)
-                if isinstance(value, torch.Tensor):
-                    if value is not expected:
-                        return None
-                elif type(value) is not int or type(expected) is not int or value != expected:
-                    return None
-        return dict(self.params)
+        if any(kwargs.get(key) is not None for key in _PACKING_KEYS):
+            return None
+        return self.params
 
 
 def _packed_params(hidden_states, position_ids, attention_mask, kwargs, *, require_metadata=False):
